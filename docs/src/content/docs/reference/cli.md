@@ -120,6 +120,21 @@ $ secretspec config provider remove prod_vault
 ✓ Provider alias 'prod_vault' removed
 ```
 
+### provider use
+Select a provider and optional profile for the current project on this machine.
+
+```bash
+secretspec provider use local --profile development
+```
+
+The selection is stored under `~/.config/secretspec/projects/` (or
+`$XDG_CONFIG_HOME`) and is scoped to the canonical `secretspec.toml` path. It
+does not modify the project manifest or store secret values. Command flags and
+`SECRETSPEC_PROVIDER`/`SECRETSPEC_PROFILE` still take precedence.
+
+Inspect or clear the selection with `secretspec provider current` and
+`secretspec provider clear`.
+
 ### check
 Check if all required secrets are available, with interactive prompting for missing secrets.
 
@@ -218,10 +233,13 @@ $ secretspec run -- node app.js  # app.js reads process.env.DATABASE_URL
 Import secrets from one provider to another.
 
 ```bash
-secretspec import <FROM_PROVIDER>
+secretspec import [<FROM_PROVIDER>] [--from <PROVIDER>] [--to <PROVIDER>] [--profile <PROFILE>]
 ```
 
-The destination provider and profile are determined from your configuration. Secrets that already exist in the destination provider will not be overwritten.
+The destination provider and profile are determined from project/global
+configuration unless `--to` or `--profile` is supplied. Secrets that already
+exist in the destination provider are not overwritten. `secretspec migrate` is
+an alias for `secretspec import`.
 
 **Arguments:**
 - `<FROM_PROVIDER>` - Provider to import from (e.g., `env`, `dotenv:/path/to/.env`)
@@ -240,6 +258,12 @@ Summary: 1 imported, 1 already exists, 1 not found in source
 
 # Import from a specific .env file
 $ secretspec import dotenv:/home/user/old-project/.env
+
+# Explicit, non-destructive local-to-Vault migration
+$ secretspec migrate \
+    --from dotenv:.env.local \
+    --to team_openbao \
+    --profile development
 ```
 
 **Use Cases:**

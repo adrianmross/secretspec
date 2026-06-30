@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2-adrian.1] - 2026-06-30
+
+### Added
+- Add composable `provider list`, `provider get`, `provider set`, and
+  `provider sync` CLI workflows for scripting secret movement without exposing
+  values in command arguments.
+- Add a `layout=flat` Vault provider mode for KV documents that store multiple
+  named SecretSpec values under one Vault path.
+- Add a disposable Vault integration test that exercises flat-document check
+  and runtime injection in CI.
+
+### Changed
+- Point package release metadata at the `adrianmross/secretspec` fork. This
+  fork release is distributed through GitHub and Homebrew only; it is not
+  published to crates.io.
+
 ## [0.12.1] - 2026-06-15
 
 ### Fixed

@@ -1774,6 +1774,58 @@ fn test_import_between_dotenv_files() {
 }
 
 #[test]
+fn test_import_resolves_source_provider_alias() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join(".env.source");
+    let target = temp_dir.path().join(".env.target");
+    fs::write(&source, "CLIENT_SECRET=from-source\n").unwrap();
+
+    let project_config = Config {
+        project: Project {
+            name: "import-alias".to_string(),
+            ..Default::default()
+        },
+        profiles: HashMap::from([(
+            "default".to_string(),
+            Profile {
+                defaults: None,
+                secrets: HashMap::from([(
+                    "CLIENT_SECRET".to_string(),
+                    Secret {
+                        required: Some(true),
+                        ..Default::default()
+                    },
+                )]),
+            },
+        )]),
+        providers: Some(HashMap::from([(
+            "local".to_string(),
+            format!("dotenv://{}", source.display()),
+        )])),
+    };
+    let global_config = GlobalConfig {
+        defaults: GlobalDefaults {
+            provider: Some(format!("dotenv://{}", target.display())),
+            profile: Some("default".to_string()),
+            providers: None,
+        },
+        audit: None,
+    };
+    let spec = Secrets::new(project_config, Some(global_config), None, None);
+
+    spec.import("local").unwrap();
+
+    let values: HashMap<String, String> = dotenvy::from_path_iter(target)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect();
+    assert_eq!(
+        values.get("CLIENT_SECRET").map(String::as_str),
+        Some("from-source")
+    );
+}
+
+#[test]
 fn test_import_edge_cases() {
     let temp_dir = TempDir::new().unwrap();
     let project_path = temp_dir.path();

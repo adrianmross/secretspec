@@ -7,6 +7,7 @@ use crate::provider::Provider as ProviderTrait;
 use crate::validation::{ValidatedSecrets, ValidationErrors};
 use colored::Colorize;
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::env;
@@ -74,6 +75,70 @@ fn find_config_file_from(start: PathBuf) -> Result<PathBuf> {
     }
 }
 
+fn absolute_manifest_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
+fn project_selection_path(project: &str, manifest: &Path) -> Result<PathBuf> {
+    let config_path = GlobalConfig::path()?;
+    let root = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("projects");
+    Ok(project_selection_path_in(&root, project, manifest))
+}
+
+fn project_selection_path_in(root: &Path, project: &str, manifest: &Path) -> PathBuf {
+    let slug: String = project
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() { "project" } else { &slug };
+    let hash = manifest
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    root.join(format!("{slug}-{hash:016x}.toml"))
+}
+
+fn load_project_selection(project: &str, manifest: &Path) -> Result<Option<ProjectSelection>> {
+    let path = project_selection_path(project, manifest)?;
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let selection: ProjectSelection = toml::from_str(&std::fs::read_to_string(path)?)?;
+    Ok(Some(selection))
+}
+
+fn save_project_selection(selection: &ProjectSelection, manifest: &Path) -> Result<PathBuf> {
+    let path = project_selection_path(&selection.project, manifest)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml::to_string_pretty(selection)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
+}
+
 /// The main entry point for the secretspec library
 ///
 /// `Secrets` manages the loading, validation, and retrieval of secrets
@@ -97,12 +162,18 @@ pub struct Secrets {
     /// from a subdirectory with `--file ../secretspec.toml` still finds the
     /// `.env` files next to the config.
     config_dir: PathBuf,
+    /// Path to the loaded project manifest. Used to scope machine-local provider
+    /// selection without writing provider choice into the repository.
+    config_path: PathBuf,
     /// Optional global user configuration
     global_config: Option<GlobalConfig>,
     /// The provider to use (if set via builder)
     provider: Option<String>,
     /// The profile to use (if set via builder)
     profile: Option<String>,
+    /// Machine-local defaults selected for this project under XDG config.
+    project_provider: Option<String>,
+    project_profile: Option<String>,
     /// Reason for this session's secret access, forwarded to providers that
     /// support audit logging (set via [`Secrets::with_reason`]).
     reason: Option<String>,
@@ -112,6 +183,16 @@ pub struct Secrets {
     /// Audit logger, if auditing is enabled (user-global `[audit]` config). `None`
     /// disables auditing. Built once per `Secrets` so all events share a session id.
     audit: Option<AuditLogger>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ProjectSelection {
+    project: String,
+    manifest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
 }
 
 /// secretspec's own opt-in for marking the current process as an agent. Lets any
@@ -249,9 +330,12 @@ impl Secrets {
         Self {
             config,
             config_dir: PathBuf::from("."),
+            config_path: PathBuf::from("secretspec.toml"),
             global_config,
             provider,
             profile,
+            project_provider: None,
+            project_profile: None,
             reason: None,
             require_reason: RequireReason::Never,
             audit: None,
@@ -298,6 +382,8 @@ impl Secrets {
     pub fn load_from(path: &Path) -> Result<Self> {
         let project_config = Config::try_from(path)?;
         let global_config = GlobalConfig::load()?;
+        let config_path = absolute_manifest_path(path)?;
+        let project_selection = load_project_selection(&project_config.project.name, &config_path)?;
         // Auditing is a per-machine concern configured in the user-global config
         // (`[audit]` in ~/.config/secretspec/config.toml), not the project. It is
         // on by default when unconfigured.
@@ -321,9 +407,14 @@ impl Secrets {
             require_reason: project_config.project.require_reason.unwrap_or_default(),
             config: project_config,
             config_dir,
+            config_path,
             global_config,
             provider: None,
             profile: None,
+            project_provider: project_selection
+                .as_ref()
+                .and_then(|selection| selection.provider.clone()),
+            project_profile: project_selection.and_then(|selection| selection.profile),
             reason: env_reason(),
             audit,
         })
@@ -369,6 +460,50 @@ impl Secrets {
     /// ```
     pub fn set_profile(&mut self, profile: impl Into<String>) {
         self.profile = Some(profile.into());
+    }
+
+    /// Persists machine-local provider/profile defaults for this project.
+    ///
+    /// The selection is stored under the user's XDG SecretSpec config directory,
+    /// keyed by the manifest path. No secret values are written.
+    pub fn save_project_selection(
+        &mut self,
+        provider: impl Into<String>,
+        profile: Option<String>,
+    ) -> Result<PathBuf> {
+        let provider = provider.into();
+        let selection = ProjectSelection {
+            project: self.config.project.name.clone(),
+            manifest: self.config_path.display().to_string(),
+            provider: Some(provider.clone()),
+            profile: profile.clone(),
+        };
+        let path = save_project_selection(&selection, &self.config_path)?;
+        self.project_provider = Some(provider);
+        self.project_profile = profile;
+        Ok(path)
+    }
+
+    /// Removes this project's machine-local provider/profile defaults.
+    pub fn clear_project_selection(&mut self) -> Result<PathBuf> {
+        let path = project_selection_path(&self.config.project.name, &self.config_path)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.project_provider = None;
+        self.project_profile = None;
+        Ok(path)
+    }
+
+    /// Returns the selected project provider/profile and the XDG selection path.
+    pub fn project_selection(&self) -> Result<(Option<String>, Option<String>, PathBuf)> {
+        Ok((
+            self.project_provider.clone(),
+            self.project_profile.clone(),
+            project_selection_path(&self.config.project.name, &self.config_path)?,
+        ))
     }
 
     /// Sets a human-readable reason for this session's secret access.
@@ -582,6 +717,7 @@ impl Secrets {
             .map(|p| p.to_string())
             .or_else(|| self.profile.clone())
             .or_else(|| env::var("SECRETSPEC_PROFILE").ok())
+            .or_else(|| self.project_profile.clone())
             .or_else(|| {
                 self.global_config
                     .as_ref()
@@ -811,6 +947,7 @@ impl Secrets {
         override_arg
             .or_else(|| self.provider.clone())
             .or_else(|| env::var("SECRETSPEC_PROVIDER").ok())
+            .or_else(|| self.project_provider.clone())
     }
 
     /// Returns the explicit provider override resolved to a URI, if one is set.
@@ -1676,7 +1813,10 @@ impl Secrets {
         let mut source_uri: Option<String> = None;
         let copy_result = (|| -> Result<()> {
             // Create the "from" provider and check availability
-            let from_provider_instance = self.build_provider(from_provider.to_string())?;
+            let source_spec = self
+                .lookup_provider_alias(from_provider)
+                .unwrap_or_else(|| from_provider.to_string());
+            let from_provider_instance = self.build_provider(source_spec)?;
             source_uri = Some(from_provider_instance.uri());
 
             eprintln!(
@@ -2496,6 +2636,57 @@ mod config_discovery_tests {
             find_config_file_from(empty.path().to_path_buf()),
             Err(SecretSpecError::NoManifest)
         ));
+    }
+
+    #[test]
+    fn project_selection_paths_are_stable_and_manifest_scoped() {
+        let root = TempDir::new().unwrap();
+        let first = project_selection_path_in(
+            root.path(),
+            "Hebe Dev",
+            Path::new("/work/hebe/secretspec.toml"),
+        );
+        let repeated = project_selection_path_in(
+            root.path(),
+            "Hebe Dev",
+            Path::new("/work/hebe/secretspec.toml"),
+        );
+        let second = project_selection_path_in(
+            root.path(),
+            "Hebe Dev",
+            Path::new("/other/hebe/secretspec.toml"),
+        );
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("hebe-dev-")
+        );
+    }
+
+    #[test]
+    fn project_selection_round_trips_without_secret_values() {
+        let root = TempDir::new().unwrap();
+        let manifest = root.path().join("secretspec.toml");
+        fs::write(&manifest, "[project]\nname='hebe'\nrevision='1.0'\n").unwrap();
+        let selection = ProjectSelection {
+            project: "hebe".to_string(),
+            manifest: manifest.display().to_string(),
+            provider: Some("wiz-openbao".to_string()),
+            profile: Some("obp-dev".to_string()),
+        };
+        let selection_root = root.path().join("config");
+        let path = project_selection_path_in(&selection_root, "hebe", &manifest);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, toml::to_string_pretty(&selection).unwrap()).unwrap();
+
+        let loaded: ProjectSelection = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(loaded.provider.as_deref(), Some("wiz-openbao"));
+        assert_eq!(loaded.profile.as_deref(), Some("obp-dev"));
     }
 
     /// Loading via an explicit **relative** path resolves against the current

@@ -36,3 +36,64 @@ jobs:
       run: rustup toolchain install stable --profile minimal
     - name: cargo test
       run: cargo test --all
+
+  vault-flat-integration:
+    runs-on: ubuntu-latest
+    services:
+      vault:
+        image: hashicorp/vault:1.19
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: ci-root
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        ports:
+          - 8200:8200
+        options: >-
+          --cap-add IPC_LOCK
+          --health-cmd "vault status -address=http://127.0.0.1:8200"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install Rust
+      run: rustup toolchain install stable --profile minimal
+    - name: Seed disposable Vault
+      run: |
+        curl --fail --silent --show-error \
+          --header "X-Vault-Token: ci-root" \
+          --header "Content-Type: application/json" \
+          --request POST \
+          --data '{"data":{"CI_SECRET":"integration-value"}}' \
+          http://127.0.0.1:8200/v1/secret/data/secretspec-ci
+    - name: Resolve flat document through SecretSpec
+      env:
+        VAULT_TOKEN: ci-root
+      run: |
+        cat > "${RUNNER_TEMP}/secretspec.toml" <<'EOF'
+        [project]
+        name = "vault-ci"
+        revision = "1.0"
+
+        [providers]
+        ci = "vault://127.0.0.1:8200/secret/secretspec-ci?tls=false&layout=flat"
+
+        [profiles.default]
+        CI_SECRET = { description = "Synthetic integration value." }
+
+        [profiles.ci.defaults]
+        providers = ["ci"]
+
+        [profiles.ci]
+        CI_SECRET = { description = "Synthetic integration value." }
+        EOF
+
+        cargo run --locked -p secretspec --no-default-features --features cli,vault -- \
+          --file "${RUNNER_TEMP}/secretspec.toml" \
+          check --profile ci --no-prompt
+
+        # Expand CI_SECRET in the child process, not in this runner shell.
+        # shellcheck disable=SC2016
+        cargo run --locked -p secretspec --no-default-features --features cli,vault -- \
+          --file "${RUNNER_TEMP}/secretspec.toml" \
+          run --profile ci -- \
+          sh -c 'test "$CI_SECRET" = integration-value'
