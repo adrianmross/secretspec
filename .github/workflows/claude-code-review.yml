@@ -12,6 +12,8 @@ on:
 
 jobs:
   claude-review:
+    # The Claude GitHub App is installed only on the upstream community repo.
+    if: github.repository == 'cachix/secretspec'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
