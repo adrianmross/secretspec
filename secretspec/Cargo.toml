@@ -2,7 +2,7 @@
 name = "secretspec"
 version.workspace = true
 edition.workspace = true
-repository = "https://github.com/cachix/secretspec"
+repository = "https://github.com/adrianmross/secretspec"
 description = "Declarative secrets, every environment, any provider"
 license = "Apache-2.0"
 
