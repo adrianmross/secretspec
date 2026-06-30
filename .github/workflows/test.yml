@@ -87,13 +87,13 @@ jobs:
         CI_SECRET = { description = "Synthetic integration value." }
         EOF
 
-        cargo run --locked -p secretspec -- \
+        cargo run --locked -p secretspec --no-default-features --features cli,vault -- \
           --file "${RUNNER_TEMP}/secretspec.toml" \
           check --profile ci --no-prompt
 
         # Expand CI_SECRET in the child process, not in this runner shell.
         # shellcheck disable=SC2016
-        cargo run --locked -p secretspec -- \
+        cargo run --locked -p secretspec --no-default-features --features cli,vault -- \
           --file "${RUNNER_TEMP}/secretspec.toml" \
           run --profile ci -- \
           sh -c 'test "$CI_SECRET" = integration-value'
