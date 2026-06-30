@@ -100,10 +100,25 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Select the provider used by this project on the current machine
+    Provider {
+        #[command(subcommand)]
+        action: ProjectProviderAction,
+    },
     /// Import secrets from a provider to another provider
+    #[command(alias = "migrate")]
     Import {
-        /// Provider backend to import from (secrets will be imported to the default provider)
-        from_provider: String,
+        /// Source provider backend. Kept for compatibility with `secretspec import dotenv:.env`.
+        from_provider: Option<String>,
+        /// Explicit source provider backend.
+        #[arg(long = "from", value_name = "PROVIDER")]
+        from: Option<String>,
+        /// Explicit destination provider backend. Defaults to the selected project/global provider.
+        #[arg(short = 't', long = "to", value_name = "PROVIDER")]
+        to: Option<String>,
+        /// Profile whose declared secrets should be migrated.
+        #[arg(short = 'P', long, env = "SECRETSPEC_PROFILE")]
+        profile: Option<String>,
     },
     /// Show the local audit log of secret access
     Audit {
@@ -156,6 +171,23 @@ enum ProviderAction {
     },
     /// List all configured provider aliases
     List,
+}
+
+/// Machine-local provider selection for the current SecretSpec project.
+#[derive(Subcommand)]
+enum ProjectProviderAction {
+    /// Select a provider and optional profile for this project
+    Use {
+        /// Provider alias or URI
+        provider: String,
+        /// Optional default profile for this project
+        #[arg(short = 'P', long)]
+        profile: Option<String>,
+    },
+    /// Show the provider/profile selected for this project
+    Current,
+    /// Remove the provider/profile selection for this project
+    Clear,
 }
 
 /// Returns an example TOML configuration string
@@ -557,6 +589,39 @@ pub fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Provider { action } => {
+            let mut app = load_secrets(&cli.file, &cli.reason)?;
+            match action {
+                ProjectProviderAction::Use { provider, profile } => {
+                    let path = app
+                        .save_project_selection(provider.clone(), profile.clone())
+                        .into_diagnostic()
+                        .wrap_err("Failed to save project provider selection")?;
+                    println!("✓ Project provider: {}", provider);
+                    if let Some(profile) = profile {
+                        println!("  Profile: {}", profile);
+                    }
+                    println!("  Config: {}", path.display());
+                }
+                ProjectProviderAction::Current => {
+                    let (provider, profile, path) = app
+                        .project_selection()
+                        .into_diagnostic()
+                        .wrap_err("Failed to read project provider selection")?;
+                    println!("Provider: {}", provider.as_deref().unwrap_or("(none)"));
+                    println!("Profile:  {}", profile.as_deref().unwrap_or("(none)"));
+                    println!("Config:   {}", path.display());
+                }
+                ProjectProviderAction::Clear => {
+                    let path = app
+                        .clear_project_selection()
+                        .into_diagnostic()
+                        .wrap_err("Failed to clear project provider selection")?;
+                    println!("✓ Project provider selection cleared: {}", path.display());
+                }
+            }
+            Ok(())
+        }
         // Set a secret value in the specified provider
         Commands::Set {
             name,
@@ -637,9 +702,33 @@ pub fn main() -> Result<()> {
             Ok(())
         }
         // Import secrets from one provider to another
-        Commands::Import { from_provider } => {
-            let app = load_secrets(&cli.file, &cli.reason)?;
-            app.import(&from_provider)
+        Commands::Import {
+            from_provider,
+            from,
+            to,
+            profile,
+        } => {
+            let source = match (from_provider, from) {
+                (Some(_), Some(_)) => {
+                    return Err(miette!(
+                        "Specify the source provider either positionally or with --from, not both"
+                    ));
+                }
+                (Some(source), None) | (None, Some(source)) => source,
+                (None, None) => {
+                    return Err(miette!(
+                        "Missing source provider. Use `secretspec import --from <provider>`"
+                    ));
+                }
+            };
+            let mut app = load_secrets(&cli.file, &cli.reason)?;
+            if let Some(destination) = to {
+                app.set_provider(destination);
+            }
+            if let Some(profile) = profile {
+                app.set_profile(profile);
+            }
+            app.import(&source)
                 .into_diagnostic()
                 .wrap_err("Failed to import secrets")?;
             Ok(())
@@ -1132,6 +1221,67 @@ mod tests {
         match cli.command {
             Commands::Check { no_prompt, .. } => assert!(no_prompt),
             _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn import_parses_explicit_source_destination_and_profile() {
+        let cli = Cli::try_parse_from([
+            "secretspec",
+            "import",
+            "--from",
+            "dotenv:.env.local",
+            "--to",
+            "wiz-openbao",
+            "--profile",
+            "obp-dev",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Import {
+                from_provider,
+                from,
+                to,
+                profile,
+            } => {
+                assert!(from_provider.is_none());
+                assert_eq!(from.as_deref(), Some("dotenv:.env.local"));
+                assert_eq!(to.as_deref(), Some("wiz-openbao"));
+                assert_eq!(profile.as_deref(), Some("obp-dev"));
+            }
+            _ => panic!("expected Import command"),
+        }
+    }
+
+    #[test]
+    fn migrate_alias_and_project_provider_use_parse() {
+        let migrate = Cli::try_parse_from([
+            "secretspec",
+            "migrate",
+            "dotenv:.env.local",
+            "--to",
+            "openbao",
+        ])
+        .unwrap();
+        assert!(matches!(migrate.command, Commands::Import { .. }));
+
+        let provider = Cli::try_parse_from([
+            "secretspec",
+            "provider",
+            "use",
+            "local",
+            "--profile",
+            "obp-dev",
+        ])
+        .unwrap();
+        match provider.command {
+            Commands::Provider {
+                action: ProjectProviderAction::Use { provider, profile },
+            } => {
+                assert_eq!(provider, "local");
+                assert_eq!(profile.as_deref(), Some("obp-dev"));
+            }
+            _ => panic!("expected project provider use command"),
         }
     }
 }

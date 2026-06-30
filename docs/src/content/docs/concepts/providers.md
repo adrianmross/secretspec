@@ -30,6 +30,9 @@ SecretSpec determines which provider to use in this order:
 3. **Environment**: `SECRETSPEC_PROVIDER`
 4. **Global default**: Default provider in user config set via `secretspec config init`
 
+A machine-local project selection made with `secretspec provider use` is
+resolved after command/environment overrides and before the global default.
+
 ## Configuration
 
 Set your default provider:
@@ -66,6 +69,22 @@ $ secretspec run --provider "onepassword://Personal/Development" -- npm start
 
 # Use a specific dotenv file
 $ secretspec run --provider "dotenv:/home/user/work/.env" -- npm test
+```
+
+Select a provider once for the current project without editing
+`secretspec.toml`:
+
+```bash
+$ secretspec provider use dotenv:.env.local --profile development
+$ secretspec run -- npm start
+```
+
+Later, migrate the same declared secrets to another provider and switch the
+project selection without changing application commands:
+
+```bash
+$ secretspec migrate --from dotenv:.env.local --to team_openbao --profile development
+$ secretspec provider use team_openbao --profile development
 ```
 
 ## Per-Secret Provider Configuration
