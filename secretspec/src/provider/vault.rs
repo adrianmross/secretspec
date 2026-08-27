@@ -397,11 +397,18 @@ impl VaultProvider {
     }
 
     /// Resolves the Vault token using the configured authentication method.
-    fn resolve_token(&self) -> Result<SecretString> {
+    ///
+    /// Async, and awaited rather than blocked on, because the callers are
+    /// already inside a runtime: `get`/`set` block on their async bodies, and
+    /// blocking a second time from in there calls `block_in_place`, which
+    /// panics on the current-thread runtime the outer `block_on` builds. That
+    /// made every non-token auth method unusable — AppRole included, before
+    /// JWT existed.
+    async fn resolve_token(&self) -> Result<SecretString> {
         match self.config.auth {
             AuthMethod::Token => Self::resolve_token_auth(),
-            AuthMethod::AppRole => super::block_on(self.resolve_approle_auth()),
-            AuthMethod::Jwt => super::block_on(self.resolve_jwt_auth()),
+            AuthMethod::AppRole => self.resolve_approle_auth().await,
+            AuthMethod::Jwt => self.resolve_jwt_auth().await,
         }
     }
 
@@ -702,7 +709,7 @@ impl VaultProvider {
             VaultLayout::Flat => self.format_flat_path(project, profile)?,
         };
         let url = self.build_url(&secret_path);
-        let token = self.resolve_token()?;
+        let token = self.resolve_token().await?;
         let headers = Self::build_headers(&token, &self.config.namespace)?;
 
         let client = reqwest::Client::new();
@@ -769,7 +776,7 @@ impl VaultProvider {
             VaultLayout::Flat => self.format_flat_path(project, profile)?,
         };
         let url = self.build_url(&secret_path);
-        let token = self.resolve_token()?;
+        let token = self.resolve_token().await?;
         let headers = Self::build_headers(&token, &self.config.namespace)?;
 
         let body = match self.config.layout {
