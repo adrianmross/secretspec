@@ -5,11 +5,16 @@
 //!
 //! # Authentication
 //!
-//! Supports two authentication methods, selected via the `auth` query parameter:
+//! Supports three authentication methods, selected via the `auth` query parameter:
 //!
 //! - Token (default) -- uses `VAULT_TOKEN` environment variable or `~/.vault-token` file
 //! - AppRole (`?auth=approle`) -- uses `VAULT_ROLE_ID` and `VAULT_SECRET_ID` environment
 //!   variables to perform an AppRole login
+//! - JWT/OIDC (`?auth=jwt`) -- exchanges a workload-identity token for a Vault
+//!   token, so CI authenticates as itself instead of holding a long-lived
+//!   credential. The JWT comes from `VAULT_JWT`, from the file named by
+//!   `VAULT_JWT_PATH` (a Kubernetes projected service account token), or is
+//!   minted from the GitHub Actions OIDC endpoint with `?jwt=github-actions`.
 //!
 //! # URI Format
 //!
@@ -17,7 +22,11 @@
 //! `openbao://[namespace@]host[:port][/mount][?key=value&...]`
 //!
 //! Query parameters:
-//! - `auth` -- authentication method: `token` (default) or `approle`
+//! - `auth` -- authentication method: `token` (default), `approle` or `jwt`
+//! - `auth_mount` -- auth backend mount path (default: the method's own name)
+//! - `role` -- Vault role for `auth=jwt` (also read from `VAULT_ROLE`)
+//! - `jwt` -- where the JWT comes from: `env` (default) or `github-actions`
+//! - `audience` -- audience to request when minting a workload-identity token
 //! - `kv` -- KV engine version: `1` or `2` (default)
 //! - `layout` -- storage layout: `secretspec` (default) or `flat`
 //! - `tls` -- enable TLS: `true` (default) or `false`
@@ -26,6 +35,9 @@
 //!
 //! - `vault://vault.example.com:8200/secret` -- KV v2, token auth
 //! - `vault://vault.example.com:8200/secret?auth=approle` -- AppRole auth
+//! - `vault://vault.example.com:8200/secret?auth=jwt&role=ci` -- JWT from `VAULT_JWT`
+//! - `openbao://bao.internal:8200/kv?auth=jwt&auth_mount=github-actions&role=ci&jwt=github-actions`
+//!   -- GitHub Actions OIDC into a JWT backend mounted at `github-actions`
 //! - `vault://ns1@vault.example.com:8200/secret` -- with Vault namespace
 //! - `openbao://bao.internal:8200/secret` -- OpenBao server
 //! - `vault://127.0.0.1:8200/secret?kv=1` -- KV v1 engine
@@ -86,6 +98,12 @@ pub enum AuthMethod {
     Token,
     /// AppRole authentication via `VAULT_ROLE_ID` and `VAULT_SECRET_ID`.
     AppRole,
+    /// JWT/OIDC authentication -- exchanges a workload-identity token for a
+    /// Vault token. This is what lets CI authenticate as itself rather than
+    /// holding a long-lived credential: GitHub Actions, GitLab CI and
+    /// Kubernetes service accounts all present a signed JWT that Vault can bind
+    /// to a role by its claims.
+    Jwt,
 }
 
 /// Storage layout for Vault / OpenBao secrets.
@@ -113,8 +131,32 @@ pub struct VaultConfig {
     pub namespace: Option<String>,
     /// Authentication method (default: Token).
     pub auth: AuthMethod,
+    /// Auth backend mount path. Defaults to the method's own name, but a Vault
+    /// admin can mount the same backend anywhere -- an estate that mounts JWT
+    /// auth at `github-actions` logs in at `/v1/auth/github-actions/login`, and
+    /// without this the provider could only ever talk to a default mount.
+    pub auth_mount: Option<String>,
+    /// Vault role to authenticate against, for methods that take one.
+    pub role: Option<String>,
+    /// Audience to request when minting a workload-identity token.
+    pub audience: Option<String>,
+    /// Where to obtain the JWT from, when `auth = Jwt`.
+    pub jwt_source: JwtSource,
     /// Storage layout (default: one KV entry per SecretSpec key).
     pub layout: VaultLayout,
+}
+
+/// Where the JWT for `auth=jwt` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JwtSource {
+    /// `VAULT_JWT`, or the file named by `VAULT_JWT_PATH` -- which is how a
+    /// Kubernetes workload reaches its projected service account token.
+    #[default]
+    Environment,
+    /// Mint one from the GitHub Actions OIDC endpoint. Opt-in via
+    /// `?jwt=github-actions` rather than sniffed from the environment, so the
+    /// provider never silently reaches for a token the caller did not ask for.
+    GithubActions,
 }
 
 impl Default for VaultConfig {
@@ -126,6 +168,10 @@ impl Default for VaultConfig {
             kv_version: KvVersion::default(),
             namespace: None,
             auth: AuthMethod::default(),
+            auth_mount: None,
+            role: None,
+            audience: None,
+            jwt_source: JwtSource::default(),
             layout: VaultLayout::default(),
         }
     }
@@ -220,8 +266,37 @@ impl TryFrom<&ProviderUrl> for VaultConfig {
             .map(|(_, v)| match v.as_ref() {
                 "approle" => Ok(AuthMethod::AppRole),
                 "token" => Ok(AuthMethod::Token),
+                "jwt" | "oidc" => Ok(AuthMethod::Jwt),
                 other => Err(SecretSpecError::ProviderOperationFailed(format!(
-                    "Unknown auth method '{}'. Expected 'token' or 'approle'.",
+                    "Unknown auth method '{}'. Expected 'token', 'approle' or 'jwt'.",
+                    other
+                ))),
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let query_value = |key: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+                .filter(|s| !s.is_empty())
+        };
+
+        let auth_mount = query_value("auth_mount");
+        // Env fallbacks so the same provider URI works unchanged across
+        // environments that bind different roles.
+        let role = query_value("role")
+            .or_else(|| std::env::var("VAULT_ROLE").ok().filter(|s| !s.is_empty()));
+        let audience = query_value("audience");
+
+        let jwt_source = url
+            .query_pairs()
+            .find(|(k, _)| k == "jwt")
+            .map(|(_, v)| match v.as_ref() {
+                "env" | "environment" => Ok(JwtSource::Environment),
+                "github-actions" | "github" => Ok(JwtSource::GithubActions),
+                other => Err(SecretSpecError::ProviderOperationFailed(format!(
+                    "Unknown jwt source '{}'. Expected 'env' or 'github-actions'.",
                     other
                 ))),
             })
@@ -249,6 +324,10 @@ impl TryFrom<&ProviderUrl> for VaultConfig {
             kv_version,
             namespace,
             auth,
+            auth_mount,
+            role,
+            audience,
+            jwt_source,
             layout,
         })
     }
@@ -322,7 +401,190 @@ impl VaultProvider {
         match self.config.auth {
             AuthMethod::Token => Self::resolve_token_auth(),
             AuthMethod::AppRole => super::block_on(self.resolve_approle_auth()),
+            AuthMethod::Jwt => super::block_on(self.resolve_jwt_auth()),
         }
+    }
+
+    /// Login endpoint for the configured auth method, honouring a custom mount.
+    fn auth_login_url(&self, default_mount: &str) -> String {
+        let mount = self
+            .config
+            .auth_mount
+            .as_deref()
+            .unwrap_or(default_mount)
+            .trim_matches('/');
+        format!("{}/v1/auth/{}/login", self.config.endpoint, mount)
+    }
+
+    /// Posts a login payload and extracts `auth.client_token`.
+    ///
+    /// Shared by AppRole and JWT: both are "POST credentials, get a token", and
+    /// the error paths are the part worth having in one place -- a claim
+    /// mismatch comes back as an HTTP error whose body is the only thing that
+    /// says which claim, so it must reach the caller rather than be flattened
+    /// into "login failed".
+    async fn login(
+        &self,
+        url: &str,
+        method: &str,
+        body: serde_json::Value,
+    ) -> Result<SecretString> {
+        let client = reqwest::Client::new();
+        let mut request = client.post(url).json(&body);
+        if let Some(namespace) = &self.config.namespace {
+            request = request.header("X-Vault-Namespace", namespace);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(format!("{} login failed: {}", method, e))
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "{} login to {} returned HTTP {}: {}",
+                method, url, status, body
+            )));
+        }
+
+        let resp: serde_json::Value = response.json().await.map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to parse {} login response: {}",
+                method, e
+            ))
+        })?;
+
+        let token = resp["auth"]["client_token"].as_str().ok_or_else(|| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "{} login response missing auth.client_token",
+                method
+            ))
+        })?;
+
+        Ok(SecretString::new(token.to_string().into()))
+    }
+
+    /// Authenticates via JWT/OIDC and returns a client token.
+    async fn resolve_jwt_auth(&self) -> Result<SecretString> {
+        let role = self.config.role.clone().ok_or_else(|| {
+            SecretSpecError::ProviderOperationFailed(
+                "JWT authentication needs a Vault role. Add `?role=<name>` to the \
+                 provider URI or set VAULT_ROLE."
+                    .to_string(),
+            )
+        })?;
+
+        let jwt = match self.config.jwt_source {
+            JwtSource::Environment => Self::jwt_from_environment()?,
+            JwtSource::GithubActions => self.jwt_from_github_actions().await?,
+        };
+
+        let body = serde_json::json!({ "role": role, "jwt": jwt.expose_secret() });
+        self.login(&self.auth_login_url("jwt"), "JWT", body).await
+    }
+
+    /// Reads the JWT from `VAULT_JWT`, or the file at `VAULT_JWT_PATH`.
+    ///
+    /// The file form is how a Kubernetes workload presents its projected
+    /// service account token, which is a path rather than a value.
+    fn jwt_from_environment() -> Result<SecretString> {
+        if let Some(jwt) = std::env::var("VAULT_JWT").ok().filter(|s| !s.is_empty()) {
+            return Ok(SecretString::new(jwt.into()));
+        }
+
+        if let Some(path) = std::env::var("VAULT_JWT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            let jwt = std::fs::read_to_string(&path).map_err(|e| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to read VAULT_JWT_PATH ({}): {}",
+                    path, e
+                ))
+            })?;
+            let jwt = jwt.trim();
+            if !jwt.is_empty() {
+                return Ok(SecretString::new(jwt.to_string().into()));
+            }
+        }
+
+        Err(SecretSpecError::ProviderOperationFailed(
+            "No JWT found for Vault authentication. Set VAULT_JWT, or VAULT_JWT_PATH \
+             to a file containing one (a Kubernetes projected service account token, \
+             for example), or use `?jwt=github-actions` to mint one."
+                .to_string(),
+        ))
+    }
+
+    /// Mints a workload-identity token from the GitHub Actions OIDC endpoint.
+    ///
+    /// Requires `permissions: id-token: write` on the job; without it GitHub
+    /// sets neither variable and the token simply is not available, so say that
+    /// rather than failing on an empty URL.
+    async fn jwt_from_github_actions(&self) -> Result<SecretString> {
+        let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(
+                    "ACTIONS_ID_TOKEN_REQUEST_URL is not set. `?jwt=github-actions` \
+                     needs a job with `permissions: id-token: write`."
+                        .to_string(),
+                )
+            })?;
+        let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(
+                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN is not set. `?jwt=github-actions` \
+                     needs a job with `permissions: id-token: write`."
+                        .to_string(),
+                )
+            })?;
+
+        let client = reqwest::Client::new();
+        // `.query` appends to the api-version already on the request URL, and
+        // encodes the audience -- which is a URL itself, so hand-concatenating
+        // it is how you get a silently truncated claim.
+        let mut request = client
+            .get(&request_url)
+            .header("Authorization", format!("bearer {}", request_token));
+        if let Some(audience) = &self.config.audience {
+            request = request.query(&[("audience", audience)]);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to request a GitHub Actions OIDC token: {}",
+                e
+            ))
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "GitHub Actions OIDC request returned HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let resp: serde_json::Value = response.json().await.map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to parse the GitHub Actions OIDC response: {}",
+                e
+            ))
+        })?;
+
+        let jwt = resp["value"].as_str().ok_or_else(|| {
+            SecretSpecError::ProviderOperationFailed(
+                "GitHub Actions OIDC response missing `value`".to_string(),
+            )
+        })?;
+
+        Ok(SecretString::new(jwt.to_string().into()))
     }
 
     /// Resolves a token via static token sources.
@@ -369,40 +631,13 @@ impl VaultProvider {
             )
         })?;
 
-        let url = format!("{}/v1/auth/approle/login", self.config.endpoint);
         let body = serde_json::json!({
             "role_id": role_id,
             "secret_id": secret_id,
         });
 
-        let client = reqwest::Client::new();
-        let response = client.post(&url).json(&body).send().await.map_err(|e| {
-            SecretSpecError::ProviderOperationFailed(format!("AppRole login failed: {}", e))
-        })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(SecretSpecError::ProviderOperationFailed(format!(
-                "AppRole login returned HTTP {}: {}",
-                status, body
-            )));
-        }
-
-        let resp: serde_json::Value = response.json().await.map_err(|e| {
-            SecretSpecError::ProviderOperationFailed(format!(
-                "Failed to parse AppRole login response: {}",
-                e
-            ))
-        })?;
-
-        let token = resp["auth"]["client_token"].as_str().ok_or_else(|| {
-            SecretSpecError::ProviderOperationFailed(
-                "AppRole login response missing auth.client_token".to_string(),
-            )
-        })?;
-
-        Ok(SecretString::new(token.to_string().into()))
+        self.login(&self.auth_login_url("approle"), "AppRole", body)
+            .await
     }
 
     /// Builds the common HTTP headers for Vault API requests.
@@ -683,5 +918,109 @@ impl Provider for VaultProvider {
 
     fn allows_set(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use url::Url;
+
+    fn provider_url(s: &str) -> ProviderUrl {
+        ProviderUrl::new(Url::parse(s).unwrap())
+    }
+
+    fn provider(s: &str) -> VaultProvider {
+        VaultProvider {
+            config: VaultConfig::try_from(&provider_url(s)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_vault_auth_jwt_is_parsed() {
+        let config = VaultConfig::try_from(&provider_url(
+            "vault://vault.example.com:8200/secret?auth=jwt&role=ci",
+        ))
+        .unwrap();
+        assert_eq!(config.auth, AuthMethod::Jwt);
+        assert_eq!(config.role.as_deref(), Some("ci"));
+        assert_eq!(config.jwt_source, JwtSource::Environment);
+    }
+
+    #[test]
+    fn test_vault_auth_oidc_is_an_alias_for_jwt() {
+        let config =
+            VaultConfig::try_from(&provider_url("vault://vault.example.com:8200?auth=oidc"))
+                .unwrap();
+        assert_eq!(config.auth, AuthMethod::Jwt);
+    }
+
+    #[test]
+    fn test_vault_unknown_auth_method_is_rejected() {
+        let result = VaultConfig::try_from(&provider_url(
+            "vault://vault.example.com:8200/secret?auth=kerberos",
+        ));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("kerberos"), "{}", err);
+        assert!(err.contains("jwt"), "{}", err);
+    }
+
+    // An estate that mounts JWT auth somewhere other than `jwt` -- as red-wiz
+    // does at `github-actions` -- is unreachable without this.
+    #[test]
+    fn test_vault_auth_mount_overrides_the_login_path() {
+        let provider = provider(
+            "vault://vault.example.com:8200/secret?auth=jwt&role=ci&auth_mount=github-actions",
+        );
+        assert_eq!(
+            provider.auth_login_url("jwt"),
+            "https://vault.example.com:8200/v1/auth/github-actions/login"
+        );
+    }
+
+    #[test]
+    fn test_vault_auth_mount_defaults_to_the_method_name() {
+        let provider = provider("vault://vault.example.com:8200/secret?auth=jwt&role=ci");
+        assert_eq!(
+            provider.auth_login_url("jwt"),
+            "https://vault.example.com:8200/v1/auth/jwt/login"
+        );
+        assert_eq!(
+            provider.auth_login_url("approle"),
+            "https://vault.example.com:8200/v1/auth/approle/login"
+        );
+    }
+
+    #[test]
+    fn test_vault_jwt_source_github_actions_is_opt_in() {
+        let config = VaultConfig::try_from(&provider_url(
+            "vault://vault.example.com:8200/secret?auth=jwt&role=ci&jwt=github-actions&audience=https%3A%2F%2Fgithub.com%2Fred-wiz",
+        ))
+        .unwrap();
+        assert_eq!(config.jwt_source, JwtSource::GithubActions);
+        assert_eq!(
+            config.audience.as_deref(),
+            Some("https://github.com/red-wiz")
+        );
+    }
+
+    #[test]
+    fn test_vault_unknown_jwt_source_is_rejected() {
+        let result = VaultConfig::try_from(&provider_url(
+            "vault://vault.example.com:8200/secret?auth=jwt&jwt=carrier-pigeon",
+        ));
+        assert!(result.is_err());
+    }
+
+    // Without a role the login body is malformed and Vault answers a generic
+    // 400, so catch it here where the message can name the fix.
+    #[test]
+    fn test_vault_jwt_without_a_role_is_rejected() {
+        let provider = provider("vault://vault.example.com:8200/secret?auth=jwt");
+        let err = super::super::block_on(provider.resolve_jwt_auth())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("role"), "{}", err);
+        assert!(err.contains("VAULT_ROLE"), "{}", err);
     }
 }

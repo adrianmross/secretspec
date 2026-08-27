@@ -25,6 +25,11 @@ openbao://[namespace@]host[:port][/mount][?key=value&...]
 - `mount`: KV engine mount path (default: `secret`)
 - `namespace@`: Optional Vault namespace (also reads `VAULT_NAMESPACE` env var)
 - `?auth=approle`: Use AppRole authentication (default: `token`)
+- `?auth=jwt`: Use JWT/OIDC workload-identity authentication
+- `?auth_mount=<path>`: Auth backend mount path (default: the method's own name)
+- `?role=<name>`: Vault role for JWT auth (also read from `VAULT_ROLE`)
+- `?jwt=github-actions`: Mint the JWT from the GitHub Actions OIDC endpoint
+- `?audience=<aud>`: Audience to request when minting a workload-identity token
 - `?kv=1`: Use KV v1 engine (default: v2)
 - `?layout=flat`: Read/write one KV document whose fields are secret names
 - `?tls=false`: Disable TLS (for development servers)
@@ -141,3 +146,61 @@ export VAULT_ROLE_ID=your-role-id
 export VAULT_SECRET_ID=your-secret-id
 secretspec run --provider "vault://vault.example.com:8200/secret?auth=approle" -- deploy
 ```
+
+#### JWT / OIDC
+
+Exchanges a workload-identity token for a Vault token, so CI authenticates as
+*itself* rather than holding a credential that has to be issued, stored and
+rotated. Vault binds a role to the token's claims, which means least privilege
+follows from where the job runs instead of from who remembered to scope a secret.
+
+Needs a role, from `?role=` or `VAULT_ROLE`:
+
+```bash
+export VAULT_JWT="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+secretspec run --provider "vault://vault.example.com:8200/secret?auth=jwt&role=my-app" -- ./server
+```
+
+A Kubernetes projected service account token is a *path*, not a value, so it can
+be named directly:
+
+```bash
+export VAULT_JWT_PATH=/var/run/secrets/kubernetes.io/serviceaccount/token
+secretspec run --provider "vault://vault.example.com:8200/secret?auth=jwt&role=my-app" -- ./server
+```
+
+##### GitHub Actions
+
+`?jwt=github-actions` mints the token from the Actions OIDC endpoint, so the
+workflow needs no token-minting step of its own. It is opt-in rather than
+detected from the environment, so the provider never reaches for a token the
+caller did not ask for.
+
+```yaml
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write        # without this GitHub issues no OIDC token at all
+    steps:
+      - run: |
+          secretspec run --provider "$PROVIDER" -- ./deploy
+        env:
+          PROVIDER: >-
+            vault://vault.example.com:8200/secret?auth=jwt&role=ci-deploy
+            &jwt=github-actions&audience=https%3A%2F%2Fgithub.com%2Fmy-org
+```
+
+##### Non-default mount paths
+
+Vault mounts an auth backend wherever the administrator puts it. `auth_mount`
+points the login at it — an estate that mounts JWT auth at `github-actions`
+logs in at `/v1/auth/github-actions/login`:
+
+```bash
+secretspec run --provider \
+  "openbao://bao.internal:8200/kv?auth=jwt&auth_mount=github-actions&role=ci&jwt=github-actions" \
+  -- ./task
+```
+
+`auth_mount` applies to AppRole too.
