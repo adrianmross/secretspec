@@ -32,9 +32,16 @@
             lockFile = ./Cargo.lock;
           };
 
-          # The vault provider is behind a feature flag, and it is the whole
-          # point of building this here.
-          buildFeatures = [ "vault" ];
+          # Only the CLI and the vault provider. The default feature set also
+          # pulls the AWS SDK, Google Cloud Secret Manager, Bitwarden and
+          # keyring — four cloud SDKs this build will never call, and enough
+          # extra compilation to exhaust a CI runner. Building the default
+          # feature set inside an ARC runner image failed exactly that way.
+          buildNoDefaultFeatures = true;
+          buildFeatures = [
+            "cli"
+            "vault"
+          ];
           cargoBuildFlags = [
             "--package"
             "secretspec"
